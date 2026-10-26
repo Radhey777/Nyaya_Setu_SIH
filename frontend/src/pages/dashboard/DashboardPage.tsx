@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Briefcase, GitBranch, Clock, ArrowRightLeft } from 'lucide-react'
 import { PageHeader } from '../../components/layout/PageHeader'
 import { DataNote, Card, SkeletonCard, ErrorState } from '../../components/ui'
-import { getDashboard } from '../../api/analytics'
+import { getDashboard, getSlaStatus } from '../../api/analytics'
 import { useAuth } from '../../contexts/AuthContext'
 
 interface StatCardProps {
@@ -32,10 +32,36 @@ export default function DashboardPage() {
     queryFn: () => getDashboard(user?.bureau_id ? { bureau_id: user.bureau_id } : undefined),
   })
 
+  const slaQuery = useQuery({
+    queryKey: ['sla-status'],
+    queryFn: getSlaStatus,
+    retry: false,
+  })
+
   return (
     <>
       <PageHeader title="Dashboard" />
       <DataNote />
+
+      {/* SLA Alert Banners */}
+      {!slaQuery.isError && (slaQuery.data?.overdue_count ?? 0) > 0 && (
+        <div className="mt-3 flex items-center gap-3 rounded-lg bg-red-50 border border-red-300 px-4 py-3">
+          <AlertTriangle className="h-5 w-5 text-red-500 flex-shrink-0" />
+          <p className="text-sm text-red-800 font-medium">
+            🚨 {slaQuery.data!.overdue_count} case{slaQuery.data!.overdue_count !== 1 ? 's are' : ' is'} overdue — immediate action required.{' '}
+            <a href="/cases?overdue=true" className="underline font-semibold">View overdue cases →</a>
+          </p>
+        </div>
+      )}
+      {!slaQuery.isError && (slaQuery.data?.approaching_count ?? 0) > 0 && (
+        <div className="mt-2 flex items-center gap-3 rounded-lg bg-amber-50 border border-amber-300 px-4 py-3">
+          <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0" />
+          <p className="text-sm text-amber-800">
+            ⚠ {slaQuery.data!.approaching_count} case{slaQuery.data!.approaching_count !== 1 ? 's are' : ' is'} approaching deadline (within 7 days).{' '}
+            <a href="/cases" className="underline">View cases →</a>
+          </p>
+        </div>
+      )}
 
       {isLoading ? (
         <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

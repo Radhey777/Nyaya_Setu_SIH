@@ -58,3 +58,16 @@ export async function getCoordinationBacklog(): Promise<CoordinationBacklogItem[
   )
   return res.data
 }
+
+export interface SlaStatus {
+  overdue: Array<{ case_id: number; case_number: string; days_overdue: number; title: string }>
+  approaching: Array<{ case_id: number; case_number: string; days_remaining: number; title: string }>
+  overdue_count: number
+  approaching_count: number
+  generated_at: string
+}
+
+export async function getSlaStatus(): Promise<SlaStatus> {
+  const res = await apiClient.get<SlaStatus>('/analytics/sla-status')
+  return res.data
+}
