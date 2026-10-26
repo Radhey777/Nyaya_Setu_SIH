@@ -1,0 +1,116 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-gov-blue: #003580;
+  --color-gov-darkblue: #001f4d;
+  --color-gov-saffron: #FF9933;
+  --color-gov-green: #138808;
+  --color-gov-orange: #f15a22;
+  --color-bg: #f0f4f8;
+  --color-surface: #ffffff;
+  --color-border: #e2e8f0;
+  --color-text-primary: #1a202c;
+  --color-text-secondary: #4a5568;
+  --color-text-muted: #718096;
+  --sidebar-width: 260px;
+  --topbar-height: 64px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text-primary);
+  margin: 0;
+  padding: 0;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Government themed utility classes */
+@layer components {
+  .gov-sidebar {
+    @apply bg-government-darkblue text-white;
+  }
+  .gov-topbar {
+    @apply bg-government-blue text-white shadow-md;
+  }
+  .btn-saffron {
+    @apply bg-government-saffron hover:bg-orange-500 text-white font-semibold transition-colors;
+  }
+  .card-base {
+    @apply bg-white rounded-xl shadow-sm border border-slate-200;
+  }
+  .page-content {
+    @apply p-6;
+  }
+  .table-header {
+    @apply bg-slate-50 text-slate-600 text-xs font-semibold uppercase tracking-wider;
+  }
+  .skeleton {
+    @apply animate-pulse bg-slate-200 rounded;
+  }
+  .status-received {
+    @apply bg-blue-100 text-blue-800;
+  }
+  .status-assigned {
+    @apply bg-indigo-100 text-indigo-800;
+  }
+  .status-under_process {
+    @apply bg-yellow-100 text-yellow-800;
+  }
+  .status-disposed {
+    @apply bg-green-100 text-green-800;
+  }
+  .status-escalated {
+    @apply bg-red-100 text-red-800;
+  }
+  .status-overdue {
+    @apply bg-red-100 text-red-800;
+  }
+  .status-transferred {
+    @apply bg-purple-100 text-purple-800;
+  }
+  .status-closed {
+    @apply bg-slate-100 text-slate-700;
+  }
+}
+
+/* Focus styles */
+*:focus-visible {
+  outline: 2px solid var(--color-gov-saffron);
+  outline-offset: 2px;
+}
+
+/* Print styles */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
