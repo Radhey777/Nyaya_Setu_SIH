@@ -58,7 +58,10 @@ VALID_APPLICATION_TRANSITIONS = {
 def _compute_priority_score(app: Application, now: datetime) -> int:
     score = 5
     if app.last_stage_change_at:
-        due = app.last_stage_change_at + timedelta(days=90)
+        lsc = app.last_stage_change_at
+        if lsc.tzinfo is None:
+            lsc = lsc.replace(tzinfo=timezone.utc)
+        due = lsc + timedelta(days=90)
         if app.current_stage not in (ApplicationStage.APPROVED, ApplicationStage.REJECTED, ApplicationStage.WITHDRAWN):
             if due < now:
                 score += 3

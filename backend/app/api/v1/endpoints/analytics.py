@@ -4,20 +4,46 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, and_
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session, aliased
 
 from app.core.security import get_current_active_user
 from app.db.session import get_db
 from app.models.case import Case, CaseStatus
-from app.models.coordination import CoordinationItem, CoordinationStatus
+from app.models.coordination import CoordinationItem, CoordinationParticipant, CoordinationStatus
 from app.models.relationship import CaseRelationship, ReviewStatus
 from app.models.transfer import TransferRequest, TransferStatus
 from app.models.institution import Institution
+from app.models.bureau import Bureau
 from app.models.user import User, UserRole
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+
+def _scoped_case_query(db: Session, current_user: User):
+    query = db.query(Case).filter(Case.is_active == True)
+    if current_user.role == UserRole.BUREAU_OFFICER:
+        query = query.filter(Case.bureau_id == current_user.bureau_id)
+    return query
+
+
+def _scoped_coordination_query(db: Session, current_user: User):
+    query = db.query(CoordinationItem)
+    if current_user.role == UserRole.BUREAU_OFFICER:
+        query = query.filter(
+            or_(
+                CoordinationItem.owner_id == current_user.id,
+                CoordinationItem.created_by_id == current_user.id,
+                CoordinationItem.participants.any(
+                    or_(
+                        CoordinationParticipant.user_id == current_user.id,
+                        CoordinationParticipant.bureau_id == current_user.bureau_id,
+                    )
+                ),
+            )
+        )
+    return query
 
 
 @router.get("/dashboard")
@@ -30,9 +56,10 @@ async def dashboard_stats(
     now = datetime.now(timezone.utc)
 
     # Base case query — scoped by role
-    case_q = db.query(Case).filter(Case.is_active == True)
-    if current_user.role == UserRole.BUREAU_OFFICER and current_user.bureau_id:
-        case_q = case_q.filter(Case.bureau_id == current_user.bureau_id)
+    case_q = _scoped_case_query(db, current_user)
+    if current_user.role == UserRole.BUREAU_OFFICER:
+        # _scoped_case_query already applies the bureau boundary.
+        pass
     elif bureau_id and current_user.role in [UserRole.SYSTEM_ADMIN, UserRole.SENIOR_MANAGEMENT, UserRole.REGIONAL_OFFICER]:
         case_q = case_q.filter(Case.bureau_id == bureau_id)
 
@@ -50,12 +77,15 @@ async def dashboard_stats(
     cases_by_bureau = []
     if current_user.role in [UserRole.SYSTEM_ADMIN, UserRole.SENIOR_MANAGEMENT, UserRole.REGIONAL_OFFICER]:
         bureau_rows = (
-            db.query(Case.bureau_id, func.count(Case.id))
-            .filter(Case.is_active == True)
-            .group_by(Case.bureau_id)
+            case_q.join(Bureau, Case.bureau_id == Bureau.id, isouter=True)
+            .with_entities(Case.bureau_id, Bureau.name, func.count(Case.id))
+            .group_by(Case.bureau_id, Bureau.name)
             .all()
         )
-        cases_by_bureau = [{"bureau_id": r[0], "count": r[1]} for r in bureau_rows]
+        cases_by_bureau = [
+            {"bureau_id": r[0], "bureau_name": r[1] or "Unassigned", "count": r[2]}
+            for r in bureau_rows
+        ]
 
     # Overdue cases
     overdue_count = case_q.filter(
@@ -64,23 +94,34 @@ async def dashboard_stats(
     ).count()
 
     # Unreviewed relationship candidates
-    unreviewed_relationships = db.query(CaseRelationship).filter(
+    relationship_q = db.query(CaseRelationship).filter(
         CaseRelationship.review_status == ReviewStatus.PENDING
-    ).count()
+    )
+    if current_user.role == UserRole.BUREAU_OFFICER:
+        case_a = aliased(Case)
+        case_b = aliased(Case)
+        relationship_q = relationship_q.join(case_a, CaseRelationship.case_a_id == case_a.id).join(
+            case_b, CaseRelationship.case_b_id == case_b.id
+        ).filter(or_(case_a.bureau_id == current_user.bureau_id, case_b.bureau_id == current_user.bureau_id))
+    unreviewed_relationships = relationship_q.count()
 
     # Pending coordination
-    pending_coordination = db.query(CoordinationItem).filter(
+    coordination_q = _scoped_coordination_query(db, current_user)
+    pending_coordination = coordination_q.filter(
         CoordinationItem.status.notin_([CoordinationStatus.CLOSED, CoordinationStatus.DISMISSED])
     ).count()
 
     # Overdue coordination
-    overdue_coordination = db.query(CoordinationItem).filter(
+    overdue_coordination = coordination_q.filter(
         CoordinationItem.status.notin_([CoordinationStatus.CLOSED, CoordinationStatus.DISMISSED]),
         (CoordinationItem.acknowledge_by < now) | (CoordinationItem.action_due_date < now)
     ).count()
 
     # Pending transfers
-    pending_transfers = db.query(TransferRequest).filter(
+    transfer_q = db.query(TransferRequest).join(Case, TransferRequest.case_id == Case.id)
+    if current_user.role == UserRole.BUREAU_OFFICER:
+        transfer_q = transfer_q.filter(Case.bureau_id == current_user.bureau_id)
+    pending_transfers = transfer_q.filter(
         TransferRequest.status == TransferStatus.REQUESTED
     ).count()
 
@@ -114,8 +155,7 @@ async def case_ageing(
 ):
     """Case ageing buckets computed from live data."""
     now = datetime.now(timezone.utc)
-    active_cases = db.query(Case).filter(
-        Case.is_active == True,
+    active_cases = _scoped_case_query(db, current_user).filter(
         Case.status.notin_([CaseStatus.DISPOSED, CaseStatus.CLOSED, CaseStatus.TRANSFERRED])
     ).all()
 
@@ -151,12 +191,18 @@ async def case_trends(
             month_end = next_d.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         else:
             month_end = now
-        count = db.query(func.count(Case.id)).filter(
+        received_count = _scoped_case_query(db, current_user).filter(
             Case.created_at >= month_start, Case.created_at < month_end
-        ).scalar()
+        ).count()
+        resolved_count = _scoped_case_query(db, current_user).filter(
+            Case.disposed_date.isnot(None),
+            Case.disposed_date >= month_start,
+            Case.disposed_date < month_end,
+        ).count()
         months.append({
             "month": month_start.strftime("%b %Y"),
-            "count": count or 0
+            "count": received_count,
+            "resolved_count": resolved_count,
         })
     return {"monthly_trends": months, "generated_at": now.isoformat()}
 
@@ -168,10 +214,10 @@ async def institution_breakdown(
     db: Session = Depends(get_db),
 ):
     """Top institutions by case count."""
+    case_q = _scoped_case_query(db, current_user)
     rows = (
-        db.query(Institution.id, Institution.canonical_name, func.count(Case.id).label("case_count"))
-        .join(Case, Case.institution_id == Institution.id, isouter=True)
-        .filter(Case.is_active == True)
+        case_q.with_entities(Institution.id, Institution.canonical_name, func.count(Case.id).label("case_count"))
+        .join(Institution, Case.institution_id == Institution.id)
         .group_by(Institution.id, Institution.canonical_name)
         .order_by(func.count(Case.id).desc())
         .limit(limit)
@@ -189,7 +235,8 @@ async def coordination_backlog(
     db: Session = Depends(get_db),
 ):
     rows = (
-        db.query(CoordinationItem.status, func.count(CoordinationItem.id))
+        _scoped_coordination_query(db, current_user)
+        .with_entities(CoordinationItem.status, func.count(CoordinationItem.id))
         .group_by(CoordinationItem.status)
         .all()
     )
@@ -208,27 +255,30 @@ async def sla_status(
     now = datetime.now(timezone.utc)
     approaching_deadline_threshold = now + timedelta(days=7)
 
-    # Base query: active cases with a due_date, excluding terminal statuses
+    # Base query: active cases, excluding terminal statuses. Cases without a
+    # configured deadline are returned in the unknown bucket instead of being
+    # silently treated as compliant.
     terminal_statuses = [CaseStatus.DISPOSED, CaseStatus.CLOSED, CaseStatus.TRANSFERRED]
-    base_q = (
-        db.query(Case)
-        .filter(
-            Case.is_active == True,
-            Case.due_date.isnot(None),
-            Case.status.notin_(terminal_statuses),
-        )
+    base_q = _scoped_case_query(db, current_user).filter(
+        Case.status.notin_(terminal_statuses)
     )
 
     # Role-scope: bureau_officer sees only own bureau cases
     if current_user.role == UserRole.BUREAU_OFFICER and current_user.bureau_id:
         base_q = base_q.filter(Case.bureau_id == current_user.bureau_id)
 
-    all_candidates = base_q.all()
+    all_active = base_q.all()
 
     overdue_cases = []
     approaching_cases = []
+    on_track = 0
+    at_risk = 0
+    no_deadline_set = 0
 
-    for c in all_candidates:
+    for c in all_active:
+        if c.due_date is None:
+            no_deadline_set += 1
+            continue
         # Normalise timezone on due_date
         due = c.due_date
         if due.tzinfo is None:
@@ -249,6 +299,9 @@ async def sla_status(
             overdue_cases.append(record)
         elif due <= approaching_deadline_threshold:
             approaching_cases.append(record)
+            at_risk += 1
+        else:
+            on_track += 1
 
     # Sort overdue by most overdue first (most negative days_remaining first)
     overdue_cases.sort(key=lambda x: x["days_remaining"])
@@ -258,8 +311,203 @@ async def sla_status(
     return {
         "overdue_count": len(overdue_cases),
         "approaching_deadline_count": len(approaching_cases),
+        "on_track": on_track,
+        "at_risk": at_risk,
+        "no_deadline_set": no_deadline_set,
+        "total_active": len(all_active),
+        "compliance_percentage": round(
+            (on_track / len(all_active) * 100), 1
+        ) if all_active else 0.0,
         "overdue_cases": overdue_cases[:50],
         "approaching_cases": approaching_cases[:50],
+        "generated_at": now.isoformat(),
+        "data_note": "DEMO DATA — Synthetic prototype data. Not official AICTE records.",
+    }
+
+
+# ─── Application Analytics ────────────────────────────────────────────────────
+
+
+@router.get("/applications/dashboard")
+async def application_dashboard_stats(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Application stage counts, overdue, critical, EVC/undertaking/doc stats."""
+    from app.models.application import Application, ApplicationStage
+    from app.models.evc import EVCTask, EVCStatus
+    from app.models.undertaking import Undertaking, UndertakingStatus
+    from app.models.document_registry import DocumentRecord
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    # Stage counts
+    stage_rows = (
+        db.query(Application.current_stage, func.count(Application.id))
+        .filter(Application.is_active == True)
+        .group_by(Application.current_stage)
+        .all()
+    )
+    stage_counts = {row[0].value: row[1] for row in stage_rows}
+
+    # Type counts
+    from app.models.application import ApplicationType
+    type_rows = (
+        db.query(Application.application_type, func.count(Application.id))
+        .filter(Application.is_active == True)
+        .group_by(Application.application_type)
+        .all()
+    )
+    type_counts = {row[0].value: row[1] for row in type_rows}
+
+    # Overdue: last_stage_change_at + 90 days < now, not in terminal stages
+    terminal = [ApplicationStage.APPROVED, ApplicationStage.REJECTED, ApplicationStage.WITHDRAWN]
+    overdue_threshold = now - timedelta(days=90)
+    overdue_count = (
+        db.query(func.count(Application.id))
+        .filter(
+            Application.is_active == True,
+            Application.last_stage_change_at < overdue_threshold,
+            Application.current_stage.notin_(terminal),
+        )
+        .scalar() or 0
+    )
+
+    # Critical (priority_score >= 9)
+    critical_count = (
+        db.query(func.count(Application.id))
+        .filter(Application.is_active == True, Application.priority_score >= 9)
+        .scalar() or 0
+    )
+
+    # Pending EVC
+    pending_evc_count = (
+        db.query(func.count(EVCTask.id))
+        .filter(EVCTask.status.notin_([EVCStatus.COMPLETED, EVCStatus.CANCELLED]))
+        .scalar() or 0
+    )
+
+    # Pending undertakings
+    pending_undertakings_count = (
+        db.query(func.count(Undertaking.id))
+        .filter(Undertaking.status.notin_([UndertakingStatus.VERIFIED, UndertakingStatus.EXPIRED]))
+        .scalar() or 0
+    )
+
+    # Expiring docs (valid_until within 30 days or already expired)
+    expiring_docs_count = (
+        db.query(func.count(DocumentRecord.id))
+        .filter(
+            or_(
+                DocumentRecord.is_expired == True,
+                DocumentRecord.valid_until < today + timedelta(days=30),
+            )
+        )
+        .scalar() or 0
+    )
+
+    return {
+        "stage_counts": stage_counts,
+        "type_counts": type_counts,
+        "overdue_count": overdue_count,
+        "critical_count": critical_count,
+        "pending_evc_count": pending_evc_count,
+        "pending_undertakings_count": pending_undertakings_count,
+        "expiring_docs_count": expiring_docs_count,
+        "generated_at": now.isoformat(),
+        "data_note": "DEMO DATA — Synthetic prototype data. Not official AICTE records.",
+    }
+
+
+@router.get("/applications/workload")
+async def application_workload(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Per-officer application count and overdue count."""
+    from app.models.application import Application, ApplicationStage
+
+    now = datetime.now(timezone.utc)
+    terminal = [ApplicationStage.APPROVED, ApplicationStage.REJECTED, ApplicationStage.WITHDRAWN]
+    overdue_threshold = now - timedelta(days=90)
+
+    rows = (
+        db.query(
+            Application.assigned_officer_id,
+            User.full_name,
+            func.count(Application.id).label("assigned_count"),
+        )
+        .join(User, Application.assigned_officer_id == User.id)
+        .filter(Application.is_active == True, Application.assigned_officer_id.isnot(None))
+        .group_by(Application.assigned_officer_id, User.full_name)
+        .all()
+    )
+
+    result = []
+    for officer_id, officer_name, assigned_count in rows:
+        overdue_count = (
+            db.query(func.count(Application.id))
+            .filter(
+                Application.assigned_officer_id == officer_id,
+                Application.is_active == True,
+                Application.last_stage_change_at < overdue_threshold,
+                Application.current_stage.notin_(terminal),
+            )
+            .scalar() or 0
+        )
+        result.append({
+            "officer_id": officer_id,
+            "officer_name": officer_name,
+            "assigned_count": assigned_count,
+            "overdue_count": overdue_count,
+        })
+
+    return {
+        "workload": result,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "data_note": "DEMO DATA — Synthetic prototype data. Not official AICTE records.",
+    }
+
+
+@router.get("/applications/ageing")
+async def application_ageing(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Bucket active applications by days since submitted_at."""
+    from app.models.application import Application, ApplicationStage
+
+    now = datetime.now(timezone.utc)
+    terminal = [ApplicationStage.APPROVED, ApplicationStage.REJECTED, ApplicationStage.WITHDRAWN]
+
+    apps = (
+        db.query(Application)
+        .filter(Application.is_active == True, Application.current_stage.notin_(terminal))
+        .all()
+    )
+
+    buckets = {"0-30": 0, "31-60": 0, "61-90": 0, "91-180": 0, "180+": 0}
+    for app in apps:
+        if app.submitted_at is None:
+            continue
+        submitted = app.submitted_at
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=timezone.utc)
+        age = (now - submitted).days
+        if age <= 30:
+            buckets["0-30"] += 1
+        elif age <= 60:
+            buckets["31-60"] += 1
+        elif age <= 90:
+            buckets["61-90"] += 1
+        elif age <= 180:
+            buckets["91-180"] += 1
+        else:
+            buckets["180+"] += 1
+
+    return {
+        "ageing": [{"range": k, "count": v} for k, v in buckets.items()],
         "generated_at": now.isoformat(),
         "data_note": "DEMO DATA — Synthetic prototype data. Not official AICTE records.",
     }
